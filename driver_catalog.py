@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""
+Windows Driver Catalog Tool
+Search, download, and extract .cab driver files from the Microsoft Update Catalog.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import textwrap
+from urllib.parse import quote, urlencode
+
+import requests
+from bs4 import BeautifulSoup
+
+CATALOG_URL = "https://www.catalog.update.microsoft.com"
+SEARCH_URL = f"{CATALOG_URL}/Search.aspx"
+DOWNLOAD_URL = f"{CATALOG_URL}/DownloadDialog.aspx"
+
+DOWNLOAD_PATTERN = re.compile(
+    r"\[(\d*)\]\.url\s*=\s*[\"'](http[s]?://[^'\"]+\.cab)[\"']"
+)
+PRODUCT_SPLIT = re.compile(r",(?=[^\s])")
+
+SESSION = requests.Session()
+SESSION.headers.update(
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+)
+
+
+class CatalogEntry:
+    """Represents a single entry from the Windows Update Catalog."""
+
+    def __init__(self, row):
+        cells = row.find_all("td")
+        self.title = cells[1].get_text().strip()
+        self.products = [
+            p.strip()
+            for p in re.split(PRODUCT_SPLIT, cells[2].get_text().strip())
+            if p.strip()
+        ]
+        self.classification = cells[3].get_text().strip()
+        try:
+            self.last_updated = datetime.datetime.strptime(
+                cells[4].get_text().strip(), "%m/%d/%Y"
+            )
+        except ValueError:
+            self.last_updated = None
+        self.version = cells[5].get_text().strip()
+        size_spans = cells[6].find_all("span")
+        self.size_str = size_spans[0].get_text().strip() if size_spans else "Unknown"
+        input_el = cells[7].find("input")
+        self.update_id = input_el.attrs["id"] if input_el else None
+
+    def get_download_urls(self):
+        """Fetch actual .cab download URLs for this entry."""
+        if not self.update_id:
+            return []
+
+        update_ids = json.dumps(
+            {"size": 0, "updateID": self.update_id, "uidInfo": self.update_id}
+        )
+        post_data = {"updateIDs": f"[{update_ids}]"}
+
+        try:
+            resp = SESSION.post(
+                DOWNLOAD_URL,
+                data=post_data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=30,
+            )
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            print(f"  [!] Error fetching download links: {e}")
+            return []
+
+        matches = DOWNLOAD_PATTERN.findall(resp.text)
+        return [url for _, url in matches]
+
+    def __str__(self):
+        date_str = (
+            self.last_updated.strftime("%Y-%m-%d") if self.last_updated else "N/A"
+        )
+        return f"{self.title}  [{self.size_str}]  ({date_str})"
+
+
+def search_catalog(query, max_pages=1):
+    """Search the Microsoft Update Catalog and return a list of CatalogEntry objects."""
+    entries = []
+    search_safe = quote(query)
+    url = f"{SEARCH_URL}?q={search_safe}"
+
+    post_data = None
+    page = 0
+
+    while page < max_pages:
+        try:
+            if post_data:
+                resp = SESSION.post(url, data=post_data, timeout=30)
+            else:
+                resp = SESSION.get(url, timeout=30)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            print(f"[!] Error searching catalog: {e}")
+            break
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        table = soup.find(id="ctl00_catalogBody_updateMatches")
+        if not table:
+            print("[!] No results table found. The catalog may have changed its layout.")
+            break
+
+        rows = table.find_all("tr")
+        if len(rows) <= 1:
+            if page == 0:
+                print("[i] No results found.")
+            break
+
+        for row in rows[1:]:
+            try:
+                entries.append(CatalogEntry(row))
+            except (IndexError, AttributeError):
+                continue
+
+        # Check for next page
+        next_page = soup.find(id="ctl00_catalogBody_nextPageLinkText")
+        if not next_page:
+            break
+
+        # Build POST data for next page
+        page_data = {"__EVENTTARGET": "ctl00$catalogBody$nextPageLinkText"}
+        for field in [
+            "__EVENTARGUMENT",
+            "__EVENTVALIDATION",
+            "__VIEWSTATE",
+            "__VIEWSTATEGENERATOR",
+        ]:
+            el = soup.find(id=field)
+            if el:
+                page_data[field] = el.attrs.get("value", "")
+
+        post_data = page_data
+        page += 1
+
+    return entries
+
+
+def download_cab(url, output_dir):
+    """Download a .cab file from the given URL into output_dir. Returns the file path."""
+    filename = url.split("/")[-1]
+    # Sanitize filename
+    filename = re.sub(r"[^\w\-.]", "_", filename)
+    if not filename.lower().endswith(".cab"):
+        filename += ".cab"
+
+    filepath = os.path.join(output_dir, filename)
+
+    print(f"  Downloading: {filename}")
+    try:
+        resp = SESSION.get(url, stream=True, timeout=120)
+        resp.raise_for_status()
+        total = int(resp.headers.get("content-length", 0))
+        downloaded = 0
+
+        with open(filepath, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    pct = downloaded * 100 // total
+                    bar = "#" * (pct // 5) + "-" * (20 - pct // 5)
+                    print(
+                        f"\r  [{bar}] {pct}% ({downloaded // 1024} KB / {total // 1024} KB)",
+                        end="",
+                        flush=True,
+                    )
+        print()
+
+        size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        print(f"  Saved: {filepath} ({size_mb:.2f} MB)")
+        return filepath
+    except requests.RequestException as e:
+        print(f"  [!] Download failed: {e}")
+        return None
+
+
+def extract_cab(cab_path, output_dir=None):
+    """Extract a .cab file using cabextract. Falls back to Python cabarchive."""
+    if output_dir is None:
+        base = os.path.splitext(os.path.basename(cab_path))[0]
+        output_dir = os.path.join(os.path.dirname(cab_path), base)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Try cabextract first (faster, handles nested cabs)
+    try:
+        result = subprocess.run(
+            ["cabextract", "-d", output_dir, cab_path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode == 0:
+            print(f"  Extracted to: {output_dir}")
+            _extract_nested_cabs(output_dir)
+            return output_dir
+        else:
+            print(f"  [!] cabextract warning: {result.stderr.strip()}")
+    except FileNotFoundError:
+        pass
+    except subprocess.TimeoutExpired:
+        print("  [!] cabextract timed out")
+
+    # Fallback: Python cabarchive
+    try:
+        import cabarchive
+
+        cab = cabarchive.CabArchive(cab_path)
+        for name in cab:
+            dest = os.path.join(output_dir, name)
+            os.makedirs(os.path.dirname(dest) if os.path.dirname(dest) else output_dir, exist_ok=True)
+            with open(dest, "wb") as f:
+                f.write(cab[name].buf)
+        print(f"  Extracted to: {output_dir}")
+        _extract_nested_cabs(output_dir)
+        return output_dir
+    except Exception as e:
+        print(f"  [!] Extraction failed: {e}")
+        return None
+
+
+def _extract_nested_cabs(directory):
+    """Recursively extract any .cab files found inside an extracted directory."""
+    for root, _dirs, files in os.walk(directory):
+        for f in files:
+            if f.lower().endswith(".cab"):
+                nested_path = os.path.join(root, f)
+                nested_out = os.path.join(root, os.path.splitext(f)[0])
+                print(f"  Extracting nested cab: {f}")
+                extract_cab(nested_path, nested_out)
+
+
+def display_results(entries):
+    """Print search results as a numbered list."""
+    if not entries:
+        return
+
+    print(f"\n{'='*80}")
+    print(f" Found {len(entries)} result(s)")
+    print(f"{'='*80}\n")
+
+    for i, entry in enumerate(entries, 1):
+        title_wrapped = textwrap.fill(
+            entry.title, width=70, subsequent_indent="       "
+        )
+        print(f"  [{i:3d}] {title_wrapped}")
+        date_str = (
+            entry.last_updated.strftime("%Y-%m-%d") if entry.last_updated else "N/A"
+        )
+        print(
+            f"       Size: {entry.size_str}  |  Date: {date_str}  |  Class: {entry.classification}"
+        )
+        if entry.products:
+            print(f"       Products: {', '.join(entry.products[:3])}")
+        print()
+
+
+def interactive_mode(entries, output_dir):
+    """Let the user select which entries to download and extract."""
+    while True:
+        print("Enter selection (e.g. 1,3,5 or 1-5 or 'all' or 'q' to quit):")
+        try:
+            choice = input("> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            break
+
+        if choice in ("q", "quit", "exit"):
+            break
+
+        if choice == "all":
+            selected = list(range(len(entries)))
+        else:
+            selected = _parse_selection(choice, len(entries))
+
+        if not selected:
+            print("[!] Invalid selection. Try again.")
+            continue
+
+        for idx in selected:
+            entry = entries[idx]
+            print(f"\n--- Processing: {entry.title} ---")
+            urls = entry.get_download_urls()
+            if not urls:
+                print("  [!] No download URLs found for this entry.")
+                continue
+
+            for url in urls:
+                cab_path = download_cab(url, output_dir)
+                if cab_path:
+                    extract_cab(cab_path)
+
+        print("\nDone! Select more entries or 'q' to quit.")
+
+
+def _parse_selection(text, total):
+    """Parse user selection like '1,3,5' or '1-5' into zero-based indices."""
+    indices = set()
+    parts = text.replace(" ", "").split(",")
+    for part in parts:
+        if "-" in part:
+            try:
+                start, end = part.split("-", 1)
+                for i in range(int(start), int(end) + 1):
+                    if 1 <= i <= total:
+                        indices.add(i - 1)
+            except ValueError:
+                continue
+        else:
+            try:
+                i = int(part)
+                if 1 <= i <= total:
+                    indices.add(i - 1)
+            except ValueError:
+                continue
+    return sorted(indices)
+
+
+def batch_mode(entries, output_dir, selections):
+    """Download and extract specific entries (non-interactive)."""
+    selected = _parse_selection(selections, len(entries))
+    if not selected:
+        print("[!] No valid selections. Use numbers like '1,3' or '1-5' or 'all'.")
+        return
+
+    for idx in selected:
+        entry = entries[idx]
+        print(f"\n--- Processing: {entry.title} ---")
+        urls = entry.get_download_urls()
+        if not urls:
+            print("  [!] No download URLs found.")
+            continue
+
+        for url in urls:
+            cab_path = download_cab(url, output_dir)
+            if cab_path:
+                extract_cab(cab_path)
+
+
+def extract_local_cabs(paths, output_dir):
+    """Extract local .cab files or all .cab files in a directory."""
+    for path in paths:
+        path = os.path.abspath(path)
+        if os.path.isdir(path):
+            for root, _dirs, files in os.walk(path):
+                for f in files:
+                    if f.lower().endswith(".cab"):
+                        cab_path = os.path.join(root, f)
+                        print(f"\n--- Extracting: {cab_path} ---")
+                        out = os.path.join(
+                            output_dir, os.path.splitext(f)[0]
+                        )
+                        extract_cab(cab_path, out)
+        elif os.path.isfile(path):
+            print(f"\n--- Extracting: {path} ---")
+            out = os.path.join(output_dir, os.path.splitext(os.path.basename(path))[0])
+            extract_cab(path, out)
+        else:
+            print(f"[!] Not found: {path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Search, download, and extract driver .cab files from the Windows Update Catalog.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Examples:
+              Search and interactively download:
+                %(prog)s "Realtek Audio"
+
+              Search and auto-download first result:
+                %(prog)s "NVIDIA" --download 1
+
+              Download all results to a custom folder:
+                %(prog)s "Intel Bluetooth" --download all --output ./intel_bt
+
+              Just list results (no download):
+                %(prog)s "USB 3.0 Host Controller" --list-only
+
+              Fetch multiple pages of results:
+                %(prog)s "Surface Pro" --pages 3
+
+              Extract local .cab files:
+                %(prog)s --extract driver.cab another.cab
+                %(prog)s --extract ./cab_folder/
+        """),
+    )
+    parser.add_argument(
+        "search", nargs="?", help="Search query for the Windows Update Catalog"
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="./downloads",
+        help="Output directory for downloaded/extracted files (default: ./downloads)",
+    )
+    parser.add_argument(
+        "-d",
+        "--download",
+        metavar="SEL",
+        help="Download selections without interactive prompt (e.g. '1,3', '1-5', 'all')",
+    )
+    parser.add_argument(
+        "-p",
+        "--pages",
+        type=int,
+        default=1,
+        help="Number of result pages to fetch (default: 1, ~25 results per page)",
+    )
+    parser.add_argument(
+        "--list-only",
+        action="store_true",
+        help="Only list results, do not download",
+    )
+    parser.add_argument(
+        "-e",
+        "--extract",
+        nargs="+",
+        metavar="PATH",
+        help="Extract local .cab file(s) or all .cab files in a directory",
+    )
+
+    args = parser.parse_args()
+
+    output_dir = os.path.abspath(args.output)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Local extraction mode
+    if args.extract:
+        extract_local_cabs(args.extract, output_dir)
+        print(f"\n[*] Extracted files saved to: {output_dir}")
+        return
+
+    if not args.search:
+        parser.print_help()
+        print("\n[!] Please provide a search query or use --extract for local .cab files.")
+        sys.exit(1)
+
+    print(f"[*] Searching Windows Update Catalog for: '{args.search}'")
+    entries = search_catalog(args.search, max_pages=args.pages)
+
+    if not entries:
+        print("[!] No results found. Try a different search term.")
+        sys.exit(1)
+
+    display_results(entries)
+
+    if args.list_only:
+        sys.exit(0)
+
+    if args.download:
+        if args.download.lower() == "all":
+            batch_mode(
+                entries,
+                output_dir,
+                ",".join(str(i) for i in range(1, len(entries) + 1)),
+            )
+        else:
+            batch_mode(entries, output_dir, args.download)
+    else:
+        interactive_mode(entries, output_dir)
+
+    print(f"\n[*] Files saved to: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
