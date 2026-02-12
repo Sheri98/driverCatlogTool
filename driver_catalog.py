@@ -8,10 +8,14 @@ import argparse
 import datetime
 import json
 import os
+import platform
 import re
+import shutil
+import struct
 import subprocess
 import sys
 import textwrap
+import zlib
 from urllib.parse import quote, urlencode
 
 import requests
@@ -195,48 +199,198 @@ def download_cab(url, output_dir):
 
 
 def extract_cab(cab_path, output_dir=None):
-    """Extract a .cab file using cabextract. Falls back to Python cabarchive."""
+    """Extract a .cab file. Tries multiple methods in order:
+    1. cabextract (Linux/macOS)
+    2. Windows expand command
+    3. Python cabarchive package
+    4. Pure-Python CAB parser (no dependencies)
+    """
     if output_dir is None:
         base = os.path.splitext(os.path.basename(cab_path))[0]
         output_dir = os.path.join(os.path.dirname(cab_path), base)
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Try cabextract first (faster, handles nested cabs)
-    try:
-        result = subprocess.run(
-            ["cabextract", "-d", output_dir, cab_path],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode == 0:
-            print(f"  Extracted to: {output_dir}")
-            _extract_nested_cabs(output_dir)
-            return output_dir
-        else:
-            print(f"  [!] cabextract warning: {result.stderr.strip()}")
-    except FileNotFoundError:
-        pass
-    except subprocess.TimeoutExpired:
-        print("  [!] cabextract timed out")
+    # Method 1: cabextract (Linux/macOS)
+    if shutil.which("cabextract"):
+        try:
+            result = subprocess.run(
+                ["cabextract", "-d", output_dir, cab_path],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode == 0:
+                print(f"  Extracted to: {output_dir}")
+                _extract_nested_cabs(output_dir)
+                return output_dir
+        except subprocess.TimeoutExpired:
+            print("  [!] cabextract timed out")
 
-    # Fallback: Python cabarchive
+    # Method 2: Windows expand command
+    if platform.system() == "Windows":
+        try:
+            result = subprocess.run(
+                ["expand", cab_path, "-F:*", output_dir],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode == 0:
+                print(f"  Extracted to: {output_dir}")
+                _extract_nested_cabs(output_dir)
+                return output_dir
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    # Method 3: Python cabarchive package
     try:
         import cabarchive
 
         cab = cabarchive.CabArchive(cab_path)
         for name in cab:
             dest = os.path.join(output_dir, name)
-            os.makedirs(os.path.dirname(dest) if os.path.dirname(dest) else output_dir, exist_ok=True)
+            parent = os.path.dirname(dest)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(dest, "wb") as f:
                 f.write(cab[name].buf)
+        print(f"  Extracted to: {output_dir}")
+        _extract_nested_cabs(output_dir)
+        return output_dir
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"  [!] cabarchive failed: {e}")
+
+    # Method 4: Pure-Python CAB parser (no dependencies needed)
+    try:
+        _extract_cab_pure_python(cab_path, output_dir)
         print(f"  Extracted to: {output_dir}")
         _extract_nested_cabs(output_dir)
         return output_dir
     except Exception as e:
         print(f"  [!] Extraction failed: {e}")
         return None
+
+
+def _extract_cab_pure_python(cab_path, output_dir):
+    """Pure-Python CAB extractor supporting NONE and MSZIP compression."""
+    with open(cab_path, "rb") as f:
+        data = f.read()
+
+    # CAB header: signature, reserved, cabinet size, reserved, files offset,
+    # reserved, version minor, version major, num folders, num files, flags
+    if data[:4] != b"MSCF":
+        raise ValueError("Not a valid CAB file (missing MSCF signature)")
+
+    cab_size = struct.unpack_from("<I", data, 8)[0]
+    files_offset = struct.unpack_from("<I", data, 16)[0]
+    num_folders = struct.unpack_from("<H", data, 26)[0]
+    num_files = struct.unpack_from("<H", data, 28)[0]
+    flags = struct.unpack_from("<H", data, 30)[0]
+
+    offset = 36
+
+    # Handle reserved fields in header
+    header_reserve = 0
+    folder_reserve = 0
+    data_reserve = 0
+    if flags & 0x0004:  # cfhdrRESERVE_PRESENT
+        header_reserve = struct.unpack_from("<H", data, offset)[0]
+        folder_reserve = struct.unpack_from("<B", data, offset + 2)[0]
+        data_reserve = struct.unpack_from("<B", data, offset + 3)[0]
+        offset += 4 + header_reserve
+
+    # Skip previous cabinet name if present
+    if flags & 0x0001:  # cfhdrPREV_CABINET
+        while data[offset] != 0:
+            offset += 1
+        offset += 1  # skip null terminator
+        while data[offset] != 0:
+            offset += 1
+        offset += 1
+
+    # Skip next cabinet name if present
+    if flags & 0x0002:  # cfhdrNEXT_CABINET
+        while data[offset] != 0:
+            offset += 1
+        offset += 1
+        while data[offset] != 0:
+            offset += 1
+        offset += 1
+
+    # Parse folders (CFFOLDER structures)
+    folders = []
+    for _ in range(num_folders):
+        data_offset = struct.unpack_from("<I", data, offset)[0]
+        num_data_blocks = struct.unpack_from("<H", data, offset + 4)[0]
+        compress_type = struct.unpack_from("<H", data, offset + 6)[0]
+        folders.append((data_offset, num_data_blocks, compress_type))
+        offset += 8 + folder_reserve
+
+    # Parse files (CFFILE structures) starting at files_offset
+    files = []
+    offset = files_offset
+    for _ in range(num_files):
+        usize = struct.unpack_from("<I", data, offset)[0]
+        uoffset = struct.unpack_from("<I", data, offset + 4)[0]
+        folder_index = struct.unpack_from("<H", data, offset + 8)[0]
+        # date and time at offset+10 and offset+12
+        attrs = struct.unpack_from("<H", data, offset + 14)[0]
+        offset += 16
+        # Read null-terminated filename
+        name_start = offset
+        while data[offset] != 0:
+            offset += 1
+        name = data[name_start:offset].decode("utf-8", errors="replace")
+        offset += 1  # skip null terminator
+        files.append((name, usize, uoffset, folder_index))
+
+    # Decompress data blocks per folder
+    folder_data = {}
+    for folder_idx, (data_off, num_blocks, comp_type) in enumerate(folders):
+        block_offset = data_off
+        raw_data = bytearray()
+        for _ in range(num_blocks):
+            # CFDATA: checksum(4), compressed_size(2), uncompressed_size(2)
+            # + data_reserve bytes + compressed data
+            _checksum = struct.unpack_from("<I", data, block_offset)[0]
+            comp_size = struct.unpack_from("<H", data, block_offset + 4)[0]
+            uncomp_size = struct.unpack_from("<H", data, block_offset + 6)[0]
+            block_offset += 8 + data_reserve
+            block_data = data[block_offset : block_offset + comp_size]
+            block_offset += comp_size
+
+            if comp_type == 0:  # NONE
+                raw_data.extend(block_data)
+            elif comp_type == 1:  # MSZIP
+                if block_data[:2] == b"CK":
+                    block_data = block_data[2:]
+                try:
+                    decompressed = zlib.decompress(block_data, -zlib.MAX_WBITS)
+                    raw_data.extend(decompressed)
+                except zlib.error:
+                    raw_data.extend(block_data)
+            else:
+                raise ValueError(
+                    f"Unsupported compression type {comp_type} (LZX/Quantum). "
+                    "Please install cabextract or cabarchive: pip install cabarchive"
+                )
+
+        folder_data[folder_idx] = bytes(raw_data)
+
+    # Write files
+    for name, usize, uoffset, folder_idx in files:
+        # Normalize path separators
+        name = name.replace("\\", os.sep).replace("/", os.sep)
+        dest = os.path.join(output_dir, name)
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fdata = folder_data[folder_idx]
+        with open(dest, "wb") as out:
+            out.write(fdata[uoffset : uoffset + usize])
 
 
 def _extract_nested_cabs(directory):
