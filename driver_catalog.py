@@ -223,6 +223,7 @@ def extract_cab(cab_path, output_dir=None):
             if result.returncode == 0:
                 print(f"  Extracted to: {output_dir}")
                 _extract_nested_cabs(output_dir)
+                scan_extracted_files(output_dir)
                 return output_dir
         except subprocess.TimeoutExpired:
             print("  [!] cabextract timed out")
@@ -239,6 +240,7 @@ def extract_cab(cab_path, output_dir=None):
             if result.returncode == 0:
                 print(f"  Extracted to: {output_dir}")
                 _extract_nested_cabs(output_dir)
+                scan_extracted_files(output_dir)
                 return output_dir
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
@@ -257,6 +259,7 @@ def extract_cab(cab_path, output_dir=None):
                 f.write(cab[name].buf)
         print(f"  Extracted to: {output_dir}")
         _extract_nested_cabs(output_dir)
+        scan_extracted_files(output_dir)
         return output_dir
     except ImportError:
         pass
@@ -268,6 +271,7 @@ def extract_cab(cab_path, output_dir=None):
         _extract_cab_pure_python(cab_path, output_dir)
         print(f"  Extracted to: {output_dir}")
         _extract_nested_cabs(output_dir)
+        scan_extracted_files(output_dir)
         return output_dir
     except Exception as e:
         print(f"  [!] Extraction failed: {e}")
@@ -402,6 +406,85 @@ def _extract_nested_cabs(directory):
                 nested_out = os.path.join(root, os.path.splitext(f)[0])
                 print(f"  Extracting nested cab: {f}")
                 extract_cab(nested_path, nested_out)
+
+
+# Driver file extensions to look for, grouped by importance
+DRIVER_FILE_TYPES = {
+    ".sys": "Driver",
+    ".inf": "Setup Info",
+    ".cat": "Catalog/Signature",
+    ".dll": "Library",
+    ".exe": "Executable",
+    ".mui": "Language Resource",
+    ".man": "Manifest",
+}
+
+
+def _format_size(size_bytes):
+    """Format byte count to human-readable string."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    else:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+
+
+def scan_extracted_files(directory):
+    """Scan extracted directory for driver files and print a summary."""
+    if not directory or not os.path.isdir(directory):
+        return
+
+    found = {}  # ext -> list of (relative_path, size)
+    other_files = []
+    total_files = 0
+
+    for root, _dirs, files in os.walk(directory):
+        for f in files:
+            fpath = os.path.join(root, f)
+            rel = os.path.relpath(fpath, directory)
+            size = os.path.getsize(fpath)
+            ext = os.path.splitext(f)[1].lower()
+            total_files += 1
+            if ext in DRIVER_FILE_TYPES:
+                found.setdefault(ext, []).append((rel, size))
+            else:
+                other_files.append((rel, size))
+
+    if total_files == 0:
+        print("  [!] No files found after extraction.")
+        return
+
+    print(f"\n  --- Driver File Summary ({total_files} files) ---")
+
+    # Show .sys files first (the main driver binaries)
+    if ".sys" in found:
+        print(f"  [+] DRIVER FILES (.sys): {len(found['.sys'])} found")
+        for rel, size in found[".sys"]:
+            print(f"      >> {rel}  ({_format_size(size)})")
+    else:
+        print("  [-] No .sys driver files found")
+
+    # Show .inf files (needed for driver installation)
+    if ".inf" in found:
+        print(f"  [+] Setup Info (.inf): {len(found['.inf'])} found")
+        for rel, size in found[".inf"]:
+            print(f"      {rel}  ({_format_size(size)})")
+
+    # Show remaining driver-related file types
+    for ext in [".cat", ".dll", ".exe", ".mui", ".man"]:
+        if ext in found:
+            label = DRIVER_FILE_TYPES[ext]
+            print(f"  [+] {label} ({ext}): {len(found[ext])} found")
+            for rel, size in found[ext]:
+                print(f"      {rel}  ({_format_size(size)})")
+
+    if other_files:
+        print(f"  [i] Other files: {len(other_files)}")
+        for rel, size in other_files:
+            print(f"      {rel}  ({_format_size(size)})")
+
+    print()
 
 
 def display_results(entries):
