@@ -686,6 +686,65 @@ def filter_wdm_only(directory):
     )
 
 
+def cleanup_output(directory, keep_exts=None):
+    """Remove .cab files and non-driver files from the output directory.
+    If keep_exts is provided, only files with those extensions are kept.
+    By default keeps only .sys files.
+    """
+    if not directory or not os.path.isdir(directory):
+        return
+
+    if keep_exts is None:
+        keep_exts = {".sys"}
+
+    removed_count = 0
+    removed_size = 0
+
+    # First pass: delete .cab files and unwanted files
+    for root, _dirs, files in os.walk(directory, topdown=False):
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext not in keep_exts:
+                fpath = os.path.join(root, f)
+                fsize = os.path.getsize(fpath)
+                try:
+                    os.remove(fpath)
+                    removed_count += 1
+                    removed_size += fsize
+                except OSError:
+                    pass
+
+    # Second pass: remove empty directories
+    for root, dirs, files in os.walk(directory, topdown=False):
+        if root == directory:
+            continue
+        if not os.listdir(root):
+            try:
+                os.rmdir(root)
+            except OSError:
+                pass
+
+    # Show what's left
+    sys_files = []
+    for root, _dirs, files in os.walk(directory):
+        for f in files:
+            if f.lower().endswith(".sys"):
+                fpath = os.path.join(root, f)
+                rel = os.path.relpath(fpath, directory)
+                sys_files.append((rel, os.path.getsize(fpath)))
+
+    print(f"\n  --- Cleanup: removed {removed_count} non-.sys file(s) "
+          f"({_format_size(removed_size)} freed) ---")
+
+    if sys_files:
+        print(f"  [+] Remaining .sys files: {len(sys_files)}")
+        for rel, size in sys_files:
+            print(f"      >> {rel}  ({_format_size(size)})")
+    else:
+        print("  [-] No .sys files remaining")
+    print()
+
+
 def display_results(entries):
     """Print search results as a numbered list."""
     if not entries:
@@ -899,6 +958,12 @@ def main():
         action="store_true",
         help="Only keep WDM drivers (remove KMDF/UMDF packages)",
     )
+    parser.add_argument(
+        "--keep-all",
+        action="store_true",
+        help="Keep all extracted files (by default only .sys files are kept, "
+        ".cab and other files are removed after extraction)",
+    )
 
     args = parser.parse_args()
 
@@ -913,6 +978,8 @@ def main():
         if args.flat:
             flat_dir = os.path.join(output_dir, "drivers")
             collect_drivers_flat(output_dir, flat_dir)
+        if not args.keep_all:
+            cleanup_output(output_dir)
         print(f"\n[*] Extracted files saved to: {output_dir}")
         return
 
@@ -951,6 +1018,9 @@ def main():
     if args.flat:
         flat_dir = os.path.join(output_dir, "drivers")
         collect_drivers_flat(output_dir, flat_dir)
+
+    if not args.keep_all:
+        cleanup_output(output_dir)
 
     print(f"\n[*] Files saved to: {output_dir}")
 
