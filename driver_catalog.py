@@ -560,6 +560,132 @@ def deduplicate_sys_files(directory):
         print("\n  --- No duplicate .sys files found ---\n")
 
 
+def collect_drivers_flat(output_dir, flat_dir):
+    """Collect all driver files from extracted subdirectories into one flat folder.
+    Deduplicates by filename+hash, keeping the newest copy.
+    """
+    os.makedirs(flat_dir, exist_ok=True)
+
+    driver_exts = {".sys", ".inf", ".cat", ".dll", ".exe", ".mui", ".man"}
+    # Track files by name -> (source_path, size, mtime, hash)
+    seen = {}
+
+    for root, _dirs, files in os.walk(output_dir):
+        # Skip the flat_dir itself to avoid copying from it
+        if os.path.abspath(root).startswith(os.path.abspath(flat_dir)):
+            continue
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext not in driver_exts:
+                continue
+            fpath = os.path.join(root, f)
+            fname_lower = f.lower()
+            stat = os.stat(fpath)
+            fhash = _file_hash(fpath)
+
+            if fname_lower in seen:
+                prev_path, prev_size, prev_mtime, prev_hash = seen[fname_lower]
+                if fhash == prev_hash:
+                    continue  # identical file, skip
+                # Different content: keep the newer/larger one
+                if stat.st_mtime > prev_mtime or (
+                    stat.st_mtime == prev_mtime and stat.st_size > prev_size
+                ):
+                    seen[fname_lower] = (fpath, stat.st_size, stat.st_mtime, fhash)
+            else:
+                seen[fname_lower] = (fpath, stat.st_size, stat.st_mtime, fhash)
+
+    if not seen:
+        print("[!] No driver files found to collect.")
+        return
+
+    copied = 0
+    for fname_lower, (src, size, mtime, fhash) in seen.items():
+        # Preserve original case from the source file
+        original_name = os.path.basename(src)
+        dest = os.path.join(flat_dir, original_name)
+        shutil.copy2(src, dest)
+        copied += 1
+
+    print(f"\n[*] Collected {copied} driver file(s) into: {flat_dir}")
+    scan_extracted_files(flat_dir)
+
+
+def is_wdm_inf(inf_path):
+    """Check if a .inf file describes a WDM driver (not KMDF/UMDF).
+    WDM drivers do NOT contain KmdfLibraryVersion or UmdfLibraryVersion.
+    """
+    try:
+        with open(inf_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read().lower()
+    except OSError:
+        return False
+
+    # KMDF drivers have KmdfLibraryVersion, UMDF drivers have UmdfLibraryVersion
+    if "kmdflibraryversion" in content or "umdflibraryversion" in content:
+        return False
+    return True
+
+
+def filter_wdm_only(directory):
+    """Remove non-WDM driver packages from the directory.
+    Parses each .inf to check for WDM, removes the entire package
+    (all files in the same folder) if it's KMDF/UMDF.
+    """
+    if not directory or not os.path.isdir(directory):
+        return
+
+    removed_packages = 0
+    kept_packages = 0
+
+    # Walk subdirectories - each extracted cab is its own folder
+    for entry in os.listdir(directory):
+        entry_path = os.path.join(directory, entry)
+        if not os.path.isdir(entry_path):
+            continue
+
+        # Find .inf files in this package
+        inf_files = []
+        for root, _dirs, files in os.walk(entry_path):
+            for f in files:
+                if f.lower().endswith(".inf"):
+                    inf_files.append(os.path.join(root, f))
+
+        if not inf_files:
+            continue
+
+        # Check if ANY .inf in this package is WDM
+        is_wdm = any(is_wdm_inf(inf) for inf in inf_files)
+
+        if is_wdm:
+            kept_packages += 1
+            inf_names = ", ".join(os.path.basename(p) for p in inf_files)
+            print(f"  [WDM] Kept: {entry} ({inf_names})")
+        else:
+            # Find what type it is for reporting
+            driver_type = "KMDF/UMDF"
+            for inf in inf_files:
+                try:
+                    with open(inf, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read().lower()
+                    if "umdflibraryversion" in content:
+                        driver_type = "UMDF"
+                    elif "kmdflibraryversion" in content:
+                        driver_type = "KMDF"
+                except OSError:
+                    pass
+
+            inf_names = ", ".join(os.path.basename(p) for p in inf_files)
+            print(f"  [{driver_type}] Removed: {entry} ({inf_names})")
+            shutil.rmtree(entry_path)
+            removed_packages += 1
+
+    print(
+        f"\n  --- WDM Filter: kept {kept_packages}, "
+        f"removed {removed_packages} non-WDM package(s) ---\n"
+    )
+
+
 def display_results(entries):
     """Print search results as a numbered list."""
     if not entries:
@@ -718,6 +844,15 @@ def main():
               Extract local .cab files:
                 %(prog)s --extract driver.cab another.cab
                 %(prog)s --extract ./cab_folder/
+
+              Collect all drivers into one flat folder:
+                %(prog)s "Realtek Audio" --download all --flat
+
+              Only keep WDM drivers (skip KMDF/UMDF):
+                %(prog)s "USB Host Controller" --download all --wdm-only
+
+              Combine both:
+                %(prog)s "Intel Network" --download all --wdm-only --flat
         """),
     )
     parser.add_argument(
@@ -754,6 +889,16 @@ def main():
         metavar="PATH",
         help="Extract local .cab file(s) or all .cab files in a directory",
     )
+    parser.add_argument(
+        "--flat",
+        action="store_true",
+        help="Collect all driver files into a single flat folder (drivers/)",
+    )
+    parser.add_argument(
+        "--wdm-only",
+        action="store_true",
+        help="Only keep WDM drivers (remove KMDF/UMDF packages)",
+    )
 
     args = parser.parse_args()
 
@@ -763,6 +908,11 @@ def main():
     # Local extraction mode
     if args.extract:
         extract_local_cabs(args.extract, output_dir)
+        if args.wdm_only:
+            filter_wdm_only(output_dir)
+        if args.flat:
+            flat_dir = os.path.join(output_dir, "drivers")
+            collect_drivers_flat(output_dir, flat_dir)
         print(f"\n[*] Extracted files saved to: {output_dir}")
         return
 
@@ -794,6 +944,13 @@ def main():
             batch_mode(entries, output_dir, args.download)
     else:
         interactive_mode(entries, output_dir)
+
+    if args.wdm_only:
+        filter_wdm_only(output_dir)
+
+    if args.flat:
+        flat_dir = os.path.join(output_dir, "drivers")
+        collect_drivers_flat(output_dir, flat_dir)
 
     print(f"\n[*] Files saved to: {output_dir}")
 
