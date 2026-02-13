@@ -6,6 +6,7 @@ Search, download, and extract .cab driver files from the Microsoft Update Catalo
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import platform
@@ -487,6 +488,78 @@ def scan_extracted_files(directory):
     print()
 
 
+def _file_hash(filepath):
+    """Compute SHA-256 hash of a file."""
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def deduplicate_sys_files(directory):
+    """Find and remove duplicate .sys files across all extracted subdirectories.
+    Duplicates are identified by filename + content hash.
+    Keeps the newest copy (by modification time) and removes the rest.
+    """
+    if not directory or not os.path.isdir(directory):
+        return
+
+    # Collect all .sys files: group by lowercase filename
+    sys_files = {}  # filename.lower() -> list of (full_path, size, mtime, hash)
+    for root, _dirs, files in os.walk(directory):
+        for f in files:
+            if f.lower().endswith(".sys"):
+                fpath = os.path.join(root, f)
+                stat = os.stat(fpath)
+                sys_files.setdefault(f.lower(), []).append(
+                    (fpath, stat.st_size, stat.st_mtime)
+                )
+
+    removed_count = 0
+    removed_size = 0
+
+    for fname, copies in sys_files.items():
+        if len(copies) < 2:
+            continue
+
+        # Compute hashes to group truly identical files
+        by_hash = {}  # hash -> list of (path, size, mtime)
+        for fpath, size, mtime in copies:
+            fhash = _file_hash(fpath)
+            by_hash.setdefault(fhash, []).append((fpath, size, mtime))
+
+        for fhash, group in by_hash.items():
+            if len(group) < 2:
+                continue
+
+            # Keep the newest copy, remove the rest
+            group.sort(key=lambda x: x[2], reverse=True)
+            keep_path = group[0][0]
+            keep_rel = os.path.relpath(keep_path, directory)
+
+            for dup_path, dup_size, _ in group[1:]:
+                dup_rel = os.path.relpath(dup_path, directory)
+                try:
+                    os.remove(dup_path)
+                    removed_count += 1
+                    removed_size += dup_size
+                    print(f"  [x] Removed duplicate: {dup_rel}")
+                except OSError as e:
+                    print(f"  [!] Could not remove {dup_rel}: {e}")
+
+            if removed_count:
+                print(f"  [=] Kept: {keep_rel}")
+
+    if removed_count > 0:
+        print(
+            f"\n  --- Deduplication: removed {removed_count} duplicate .sys file(s) "
+            f"({_format_size(removed_size)} freed) ---\n"
+        )
+    else:
+        print("\n  --- No duplicate .sys files found ---\n")
+
+
 def display_results(entries):
     """Print search results as a numbered list."""
     if not entries:
@@ -547,7 +620,8 @@ def interactive_mode(entries, output_dir):
                 if cab_path:
                     extract_cab(cab_path)
 
-        print("\nDone! Select more entries or 'q' to quit.")
+        deduplicate_sys_files(output_dir)
+        print("Done! Select more entries or 'q' to quit.")
 
 
 def _parse_selection(text, total):
@@ -593,6 +667,8 @@ def batch_mode(entries, output_dir, selections):
             if cab_path:
                 extract_cab(cab_path)
 
+    deduplicate_sys_files(output_dir)
+
 
 def extract_local_cabs(paths, output_dir):
     """Extract local .cab files or all .cab files in a directory."""
@@ -614,6 +690,8 @@ def extract_local_cabs(paths, output_dir):
             extract_cab(path, out)
         else:
             print(f"[!] Not found: {path}")
+
+    deduplicate_sys_files(output_dir)
 
 
 def main():
